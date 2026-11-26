@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <windows.h>
 #include <conio.h>
+#include <stdlib.h>   // system()
 
 #define MAX_RESOURCES 100
 
@@ -14,6 +15,13 @@
 #define ROWS 5
 #define COLS 9
 #define NO_UNIT (-1)
+
+#define MAX_ENEMIES     100
+#define MAX_PROJECTILES 200
+
+#define SHOT_SPEED  6.0   /* 예시: 초당 6칸 이동 */
+#define COMBAT_STEP 0.02  /* 전투를 0.02초 단위로 갱신 */
+
 
 typedef enum {
     UNIT_ATTACK,
@@ -601,11 +609,370 @@ void printPlacementStatus(
     }
 }
 
+/* 적 한 개의 전투 상태 */
+typedef struct {
+    bool active;
+    int row;
+    double x;                /* 현재 열 위치 */
+    int hp;
+    int attackPower;
+    double attackInterval;   /* 공격 간격(초) */
+    double attackElapsed;    /* 접촉 후 누적된 공격 시간 */
+} CombatEnemy;
+
+/* 투사체 한 개의 상태 */
+typedef struct {
+    bool active;
+    int row;
+    double x;
+    int damage;
+} Projectile;
+
+/* 적과 투사체의 공통 저장소 */
+typedef struct {
+    CombatEnemy enemies[MAX_ENEMIES];
+    Projectile shots[MAX_PROJECTILES];
+    double accumulatedTime;
+} CombatState;
+
+/* 같은 행 앞쪽에 살아 있는 적이 있는지 검사 */
+static bool hasEnemyAhead(const CombatState* combat, const Unit* unit)
+{
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        const CombatEnemy* enemy = &combat->enemies[i];
+
+        if (enemy->active && enemy->hp > 0 &&
+            enemy->row == unit->row && enemy->x > unit->col) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 빈 투사체 슬롯에 한 발 생성 */
+static bool fireProjectile(CombatState* combat,
+    const Unit* unit, int damage)
+{
+    for (int i = 0; i < MAX_PROJECTILES; i++) {
+        if (!combat->shots[i].active) {
+            combat->shots[i] = (Projectile){
+                .active = true,
+                .row = unit->row,
+                .x = (double)unit->col,
+                .damage = damage
+            };
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 공격형 유닛의 자동 발사 */
+static void updateUnitFire(PlacementState* placement,
+    CombatState* combat, double dt)
+{
+    for (int i = 0; i < MAX_UNITS; i++) {
+        Unit* unit = &placement->units[i];
+
+        if (!unit->active || unit->type != UNIT_ATTACK) {
+            continue;
+        }
+
+        const UnitSpec* spec = &placement->specs[unit->type];
+
+        if (spec->attackPower <= 0 || spec->attackInterval <= 0.0) {
+            continue;
+        }
+
+        unit->attackElapsed += dt;
+
+        /* 적이 없는 동안 공격 횟수가 무한히 쌓이지 않도록 한다. */
+        if (unit->attackElapsed >= spec->attackInterval) {
+            unit->attackElapsed = spec->attackInterval;
+
+            if (hasEnemyAhead(combat, unit) &&
+                fireProjectile(combat, unit, spec->attackPower)) {
+                unit->attackElapsed = 0.0;
+            }
+        }
+    }
+}
+
+/* 투사체 이동, 첫 충돌 판정, 적 피해 처리 */
+static void updateProjectiles(CombatState* combat, double dt)
+{
+    for (int i = 0; i < MAX_PROJECTILES; i++) {
+        Projectile* shot = &combat->shots[i];
+
+        if (!shot->active) {
+            continue;
+        }
+
+        double oldX = shot->x;
+        double newX = oldX + SHOT_SPEED * dt;
+        int hitIndex = -1;
+
+        for (int j = 0; j < MAX_ENEMIES; j++) {
+            const CombatEnemy* enemy = &combat->enemies[j];
+
+            if (!enemy->active || enemy->hp <= 0 ||
+                enemy->row != shot->row) {
+                continue;
+            }
+
+            /* 이번 이동 구간 안에 있고 필드 안에 있는 적만 검사 */
+            if (enemy->x < oldX || enemy->x > newX ||
+                enemy->x >= COLS) {
+                continue;
+            }
+
+            /* 배열에서 먼저 나온 적이 아니라 실제로 가까운 적 선택 */
+            if (hitIndex < 0 ||
+                enemy->x < combat->enemies[hitIndex].x) {
+                hitIndex = j;
+            }
+        }
+
+        if (hitIndex >= 0) {
+            CombatEnemy* enemy = &combat->enemies[hitIndex];
+
+            enemy->hp -= shot->damage;
+            if (enemy->hp <= 0) {
+                enemy->hp = 0;
+                enemy->active = false;
+            }
+
+            shot->active = false;
+        }
+        else if (newX >= COLS) {
+            shot->active = false;
+        }
+        else {
+            shot->x = newX;
+        }
+    }
+}
+
+/* 적의 바로 왼쪽에 맞닿아 있는 유닛을 찾는다. */
+static int findContactUnit(const PlacementState* placement,
+    const CombatEnemy* enemy)
+{
+    if (enemy->row < 0 || enemy->row >= ROWS) {
+        return NO_UNIT;
+    }
+
+    for (int col = COLS - 1; col >= 0; col--) {
+        double distance = enemy->x - col;
+
+        /* 같은 행에서 오른쪽으로 반 칸 이내이면 접촉 상태 */
+        if (distance < 0.0 || distance > 0.500001) {
+            continue;
+        }
+
+        int id = placement->field.cells[enemy->row][col].unitId;
+
+        if (id >= 0 && id < MAX_UNITS &&
+            placement->units[id].active) {
+            return id;
+        }
+    }
+    return NO_UNIT;
+}
+
+/* 유닛 피해 처리: 파괴되면 해당 칸을 다시 비운다. */
+static void damagePlacedUnit(PlacementState* placement,
+    int unitId, int damage)
+{
+    Unit* unit = &placement->units[unitId];
+
+    if (!unit->active || damage <= 0) {
+        return;
+    }
+
+    unit->currentHp -= damage;
+
+    if (unit->currentHp <= 0) {
+        unit->currentHp = 0;
+        unit->active = false;
+        placement->field.cells[unit->row][unit->col].unitId = NO_UNIT;
+    }
+}
+
+/* 유닛과 접촉한 적의 근접 공격 */
+static void updateEnemyAttacks(PlacementState* placement,
+    CombatState* combat, double dt)
+{
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        CombatEnemy* enemy = &combat->enemies[i];
+
+        if (!enemy->active || enemy->hp <= 0 ||
+            enemy->attackPower <= 0 || enemy->attackInterval <= 0.0) {
+            continue;
+        }
+
+        /* 매번 다시 검사하므로 이미 파괴된 유닛은 공격하지 않는다. */
+        int unitId = findContactUnit(placement, enemy);
+
+        if (unitId == NO_UNIT) {
+            enemy->attackElapsed = 0.0;
+            continue;
+        }
+
+        enemy->attackElapsed += dt;
+
+        if (enemy->attackElapsed >= enemy->attackInterval) {
+            enemy->attackElapsed -= enemy->attackInterval;
+            damagePlacedUnit(placement, unitId, enemy->attackPower);
+        }
+    }
+}
+
+/* runGame()이 호출하는 대표 전투 함수 */
+void updateCombat(PlacementState* placement,
+    CombatState* combat, double deltaTime)
+{
+    if (placement == NULL || combat == NULL || deltaTime <= 0.0) {
+        return;
+    }
+
+    combat->accumulatedTime += deltaTime;
+
+    while (combat->accumulatedTime >= COMBAT_STEP) {
+        updateUnitFire(placement, combat, COMBAT_STEP);
+        updateProjectiles(combat, COMBAT_STEP);
+        updateEnemyAttacks(placement, combat, COMBAT_STEP);
+
+        combat->accumulatedTime -= COMBAT_STEP;
+    }
+}
+
+/* 실시간으로 유닛이 배치가 되었는지 보는 함수 */
+
+/* 해당 칸에 실제로 배치된 유닛을 문자로 반환 */
+static char getCellSymbol(const PlacementState* state, int row, int col)
+{
+    int unitId = state->field.cells[row][col].unitId;
+
+    if (unitId == NO_UNIT) {
+        return state->field.terrain[row][col].buildable ? '.' : '#';
+    }
+
+    /* 잘못된 번호로 유닛 배열에 접근하지 않도록 검사 */
+    if (unitId < 0 || unitId >= MAX_UNITS) {
+        return '?';
+    }
+
+    const Unit* unit = &state->units[unitId];
+
+    if (!unit->active) {
+        return '?';  /* 칸은 점유 중인데 유닛은 비활성인 경우 */
+    }
+
+    switch (unit->type) {
+    case UNIT_ATTACK:   return 'A';
+    case UNIT_DEFENSE:  return 'D';
+    case UNIT_PRODUCER: return 'P';
+    default:            return '?';
+    }
+}
+
+/* 필드, 선택 위치, 자원, 배치 결과를 한 화면에 출력 */
+static void drawGameScreen(
+    const PlacementState* state,
+    const ResourceState* resources,
+    UnitType selectedType,
+    int selectedRow,
+    int selectedCol,
+    const char* message
+)
+{
+    /* 화면을 매번 지우지 않고 같은 위치에 덮어쓴다. */
+    HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
+    COORD origin = { 0, 0 };
+    SetConsoleCursorPosition(console, origin);
+
+    printf("=== 유닛 배치형 디펜스 ===\n");
+    printf("1: 공격형 | 2: 방어형 | 3: 생산형 | WASD: 이동\n");
+    printf("Enter: 배치 | Space: 자원 수집 | Q: 종료\n\n");
+
+    /* 열 번호 */
+    printf("     ");
+    for (int col = 0; col < COLS; col++) {
+        printf(" %d ", col + 1);
+    }
+    printf("\n");
+
+    /* 행 번호와 각 칸의 상태 */
+    for (int row = 0; row < ROWS; row++) {
+        printf("%2d | ", row + 1);
+
+        for (int col = 0; col < COLS; col++) {
+            char symbol = getCellSymbol(state, row, col);
+
+            if (row == selectedRow && col == selectedCol) {
+                printf("[%c]", symbol);
+            }
+            else {
+                printf(" %c ", symbol);
+            }
+        }
+        printf("\n");
+    }
+
+    printf("\nA: 공격형 | D: 방어형 | P: 생산형 | .: 빈칸 | #: 배치 불가\n");
+
+    /* 숫자와 메시지 뒤의 공백은 이전 출력의 잔여 문자를 지운다. */
+    printf("보유 자원: %-8lld | 수집 가능: %-8d\n",
+        resources->ownedResources,
+        getAvailableResources(resources));
+
+    printf("선택: %s | 위치: %d행 %d열 | 설치 비용: %d          \n",
+        state->specs[selectedType].name,
+        selectedRow + 1,
+        selectedCol + 1,
+        state->specs[selectedType].cost);
+
+    /* 종류별 배치 대기시간 표시 */
+    ULONGLONG now = GetTickCount64();
+
+    printf("배치 대기 | ");
+
+    for (int i = 0; i < UNIT_TYPE_COUNT; i++) {
+        ULONGLONG readyTime = state->nextPlacementTime[i];
+
+        printf("%s: ", state->specs[i].name);
+
+        if (readyTime > now) {
+            ULONGLONG remainingMs = readyTime - now;
+
+            /* 0.1초가 남아도 0초가 아닌 1초로 표시 */
+            unsigned int remainingSec =
+                (unsigned int)((remainingMs + 999) / 1000);
+
+            printf("%2u초", remainingSec);
+        }
+        else {
+            printf("준비");
+        }
+
+        if (i < UNIT_TYPE_COUNT - 1) {
+            printf(" | ");
+        }
+    }
+
+    printf("      \n");   // 이전 출력의 잔여 문자 지우기
+    printf("상태: %s                                \n", message);
+    fflush(stdout);
+}
+
+
+
 /* 자원 생성과 배치를 하나의 반복문에서 처리 */
 void runGame(void)
 {
     ResourceState resources;
     PlacementState placement;
+    CombatState combat = { 0 };
 
     initResources(&resources);
     initPlacementSystem(&placement);
@@ -621,9 +988,7 @@ void runGame(void)
 
     const char* message = "유닛과 위치를 선택하세요.";
 
-    printf("1: 공격형 / 2: 방어형 / 3: 생산형\n");
-    printf("WASD: 위치 이동 / Enter: 배치\n");
-    printf("SPACE: 자원 수집 / Q: 종료\n\n");
+    system("cls");   // Windows 콘솔에서 게임 시작 시 한 번만 지운다.
 
     while (running) {
         /* 실제 경과 시간 계산 */
@@ -745,17 +1110,16 @@ void runGame(void)
             break;
         }
 
-        printf(
-            "\r보유:%lld 수집:%d | %s (%d,%d) | %s"
-            "                              ",
-            resources.ownedResources,
-            getAvailableResources(&resources),
-            placement.specs[selectedType].name,
-            selectedRow + 1,
-            selectedCol + 1,
+        updateCombat(&placement, &combat, deltaTime);
+
+        drawGameScreen(
+            &placement,
+            &resources,
+            selectedType,
+            selectedRow,
+            selectedCol,
             message
         );
-        fflush(stdout);
 
         Sleep(50);
     }
